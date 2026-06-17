@@ -20,8 +20,10 @@ set -euo pipefail
 # Konfiguration
 # ----------------------------------------------------------------------------
 TOOLS_DIR="${TOOLS_DIR:-$HOME/tools}"
+LOCAL_BIN="$HOME/.local/bin"
 
 mkdir -p "$TOOLS_DIR"
+mkdir -p "$LOCAL_BIN"
 
 # ----------------------------------------------------------------------------
 # Logging
@@ -47,15 +49,23 @@ else
 fi
 
 # PATH erweitern
-export PATH="$GO_BIN:$TOOLS_DIR:$PATH"
+export PATH="$LOCAL_BIN:$GO_BIN:$TOOLS_DIR:$PATH"
 
-if ! grep -Fq "$GO_BIN" "$HOME/.bashrc" 2>/dev/null; then
-    printf 'export PATH="$PATH:%s"\n' "$GO_BIN" >> "$HOME/.bashrc"
-fi
+ensure_path() {
+    local dir="$1"
+    if ! grep -Fq "$dir" "$HOME/.bashrc" 2>/dev/null; then
+        printf 'export PATH="$PATH:%s"\n' "$dir" >> "$HOME/.bashrc"
+    fi
+}
 
-if ! grep -Fq "$TOOLS_DIR" "$HOME/.bashrc" 2>/dev/null; then
-    printf 'export PATH="$PATH:%s"\n' "$TOOLS_DIR" >> "$HOME/.bashrc"
-fi
+ensure_path "$LOCAL_BIN"
+ensure_path "$GO_BIN"
+ensure_path "$TOOLS_DIR"
+
+pip_install() {
+    python3 -m pip install --quiet --break-system-packages "$@" \
+        || python3 -m pip install --quiet --user "$@"
+}
 
 # ----------------------------------------------------------------------------
 # Go Tools
@@ -73,8 +83,7 @@ go install -v github.com/OJ/gobuster/v3@latest                                &&
 # ----------------------------------------------------------------------------
 log "Installiere Python-Tools..."
 
-python3 -m pip install --quiet --break-system-packages arjun \
-    || python3 -m pip install --quiet --user arjun
+pip_install arjun
 
 ok "arjun"
 
@@ -97,17 +106,16 @@ clone_repo() {
 
 clone_repo "https://github.com/GerbenJavado/LinkFinder.git" "$TOOLS_DIR/LinkFinder"
 ( cd "$TOOLS_DIR/LinkFinder" && \
-  python3 -m pip install --quiet --break-system-packages -r requirements.txt || \
-  python3 -m pip install --quiet --user -r requirements.txt )
+  pip_install -r requirements.txt )
 ok "LinkFinder"
 
 clone_repo "https://github.com/devanshbatham/ParamSpider.git" "$TOOLS_DIR/ParamSpider"
+( cd "$TOOLS_DIR/ParamSpider" && pip_install . )
 ok "ParamSpider"
 
 clone_repo "https://github.com/s0md3v/XSStrike.git" "$TOOLS_DIR/XSStrike"
 ( cd "$TOOLS_DIR/XSStrike" && \
-  python3 -m pip install --quiet --break-system-packages -r requirements.txt || \
-  python3 -m pip install --quiet --user -r requirements.txt )
+  pip_install -r requirements.txt )
 ok "XSStrike"
 
 clone_repo "https://github.com/sqlmapproject/sqlmap.git" "$TOOLS_DIR/sqlmap"
@@ -118,36 +126,54 @@ ok "sqlmap"
 # ----------------------------------------------------------------------------
 log "Installiere Kiterunner..."
 
-KR_VERSION="1.0.0"
-KR_TARBALL="kiterunner-${KR_VERSION}-linux-amd64.tar.gz"
+KR_VERSION="1.0.2"
+case "$(uname -m)" in
+    x86_64|amd64) KR_ARCH="amd64" ;;
+    aarch64|arm64) KR_ARCH="arm64" ;;
+    i386|i686) KR_ARCH="386" ;;
+    *)
+        KR_ARCH=""
+        warn "Nicht unterstützte Kiterunner-Architektur: $(uname -m)"
+        ;;
+esac
+KR_TARBALL="kiterunner_${KR_VERSION}_linux_${KR_ARCH}.tar.gz"
 KR_URL="https://github.com/assetnote/kiterunner/releases/download/v${KR_VERSION}/${KR_TARBALL}"
 
-if ! command -v kr >/dev/null 2>&1; then
+if [[ -n "${KR_ARCH:-}" ]] && ! command -v kr >/dev/null 2>&1; then
     KR_TMP="$(mktemp -d)"
-    trap 'rm -rf "$KR_TMP"' EXIT
-    cd "$KR_TMP"
-    wget -q "$KR_URL" -O "$KR_TARBALL" || curl -fsSL "$KR_URL" -o "$KR_TARBALL"
-
-    tar -xzf "$KR_TARBALL"
-
-    KR_BIN="$(find . -maxdepth 2 -type f \( -name kr -o -name kiterunner \) -perm /111 | head -n 1)"
-    if [[ -z "$KR_BIN" ]]; then
-        err "Kiterunner-Binary nicht im Release-Archiv gefunden"
-        exit 1
+    if (
+        cd "$KR_TMP"
+        wget -q "$KR_URL" -O "$KR_TARBALL" || curl -fsSL "$KR_URL" -o "$KR_TARBALL"
+        tar -xzf "$KR_TARBALL"
+        KR_BIN="$(find . -maxdepth 2 -type f \( -name kr -o -name kiterunner \) -perm /111 | head -n 1)"
+        if [[ -z "$KR_BIN" ]]; then
+            err "Kiterunner-Binary nicht im Release-Archiv gefunden"
+            exit 1
+        fi
+        sudo install -m 0755 "$KR_BIN" /usr/local/bin/kr 2>/dev/null || \
+            install -m 0755 "$KR_BIN" "$TOOLS_DIR/kr"
+    ); then
+        ok "kiterunner"
+    else
+        warn "Kiterunner-Installation fehlgeschlagen – optionaler Stage wird übersprungen, wenn kr fehlt"
     fi
-
-    sudo install -m 0755 "$KR_BIN" /usr/local/bin/kr 2>/dev/null || \
-        install -m 0755 "$KR_BIN" "$TOOLS_DIR/kr"
-
-    mkdir -p "$TOOLS_DIR/kiterunner-wordlists"
-
-    wget -q \
-      "https://github.com/assetnote/kiterunner/raw/master/kite/200000-endpoints.kite" \
-      -O "$TOOLS_DIR/kiterunner-wordlists/large.kite" || true
-
-    ok "kiterunner"
+    rm -rf "$KR_TMP"
 else
     warn "kiterunner bereits installiert"
+fi
+
+mkdir -p "$TOOLS_DIR/kiterunner-wordlists"
+if [[ ! -f "$TOOLS_DIR/kiterunner-wordlists/routes-small.kite" ]]; then
+    KR_WORDLIST_TGZ="$TOOLS_DIR/kiterunner-wordlists/routes-small.kite.tar.gz"
+    if wget -q "https://wordlists-cdn.assetnote.io/data/kiterunner/routes-small.kite.tar.gz" -O "$KR_WORDLIST_TGZ" \
+        || curl -fsSL "https://wordlists-cdn.assetnote.io/data/kiterunner/routes-small.kite.tar.gz" -o "$KR_WORDLIST_TGZ"; then
+        tar -xzf "$KR_WORDLIST_TGZ" -C "$TOOLS_DIR/kiterunner-wordlists"
+        rm -f "$KR_WORDLIST_TGZ"
+        ok "Kiterunner routes-small.kite"
+    else
+        rm -f "$KR_WORDLIST_TGZ"
+        warn "Kiterunner-Wortliste konnte nicht heruntergeladen werden"
+    fi
 fi
 
 # ----------------------------------------------------------------------------
@@ -176,6 +202,7 @@ Installation abgeschlossen
 
 Go Tools:      $GO_BIN
 Git Tools:     $TOOLS_DIR
+Python Tools:  $LOCAL_BIN
 Wordlists:     $WORDLIST_DIR
 
 Ausführen:

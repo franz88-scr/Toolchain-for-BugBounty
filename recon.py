@@ -48,13 +48,13 @@ import shlex
 import shutil
 import subprocess
 import sys
-import tempfile
+import threading
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 # =============================================================================
 #  ANSI-Farben (deaktivieren, wenn nicht TTY)
@@ -126,10 +126,11 @@ TOOLS: List[Tool] = [
 
     Tool("paramspider", "ParamSpider",
          "https://github.com/devanshbatham/ParamSpider",
-         "paramspider.py",
-         "git clone https://github.com/devanshbatham/ParamSpider.git $HOME/tools/ParamSpider",
+         "paramspider",
+         "git clone https://github.com/devanshbatham/ParamSpider.git $HOME/tools/ParamSpider "
+         "&& python3 -m pip install --user $HOME/tools/ParamSpider",
          "git",
-         path_override=str(Path.home() / "tools/ParamSpider/paramspider.py")),
+         path_override=str(Path.home() / ".local/bin/paramspider")),
 
     Tool("arjun",       "Arjun",
          "https://github.com/s0md3v/Arjun",
@@ -146,7 +147,7 @@ TOOLS: List[Tool] = [
     Tool("kiterunner",  "Kiterunner",
          "https://github.com/assetnote/kiterunner",
          "kr",
-         "siehe install.sh (Binary-Release von GitHub)",
+         "siehe install.sh (Binary-Release v1.0.2 von GitHub)",
          "binary",
          required=False),  # optional, Gobuster ist Alternative
 
@@ -215,6 +216,7 @@ class Pipeline:
         self.results: Dict[str, dict] = {}
         self.binaries: Dict[str, str] = {}    # name → resolved path
         self.start_time = time.time()
+        self._log_lock = threading.Lock()
 
         # Output-Struktur
         for sub in ("subs", "urls", "js", "params", "arjun", "bruteforce", "exploits"):
@@ -225,10 +227,11 @@ class Pipeline:
         return self.out / "pipeline.log"
 
     def log(self, msg: str) -> None:
-        print(msg)
-        with open(self._logfile(), "a", encoding="utf-8") as f:
-            # ANSI-Escapes aus dem Logfile raus halten
-            f.write(_ANSI_RE.sub("", msg) + "\n")
+        with self._log_lock:
+            print(msg)
+            with open(self._logfile(), "a", encoding="utf-8") as f:
+                # ANSI-Escapes aus dem Logfile raus halten
+                f.write(_ANSI_RE.sub("", msg) + "\n")
 
     def info(self, m): self.log(f"{C.CY}[*]{C.N} {m}")
     def ok(self, m):   self.log(f"{C.G}[+]{C.N} {m}")
@@ -239,7 +242,7 @@ class Pipeline:
     # ---------------------------------------------------------------- File IO
     def _read(self, p: Path) -> List[str]:
         if not p.exists(): return []
-        return [l.strip() for l in p.read_text(errors="ignore").splitlines() if l.strip()]
+        return [l.strip() for l in p.read_text(encoding="utf-8", errors="ignore").splitlines() if l.strip()]
 
     def _write(self, p: Path, lines: Sequence[str]) -> None:
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -253,15 +256,37 @@ class Pipeline:
     def _resolve(self, tool: Tool) -> Optional[str]:
         if tool.path_override:
             p = Path(os.path.expanduser(tool.path_override))
-            if p.exists():
+            if p.exists() and self._is_expected_tool(tool, str(p)):
                 return str(p)
             # Fallback: wenn path_override definiert ist, aber Datei fehlt,
             # versuchen wir es trotzdem in PATH (z. B. bei custom install path).
             found = shutil.which(tool.binary)
-            if found:
+            if found and self._is_expected_tool(tool, found):
                 return found
             return None
-        return shutil.which(tool.binary)
+        found = shutil.which(tool.binary)
+        if found and self._is_expected_tool(tool, found):
+            return found
+        return None
+
+    def _is_expected_tool(self, tool: Tool, path: str) -> bool:
+        if tool.name != "httpx":
+            return True
+        try:
+            proc = subprocess.run(
+                [path, "-version"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        output = proc.stdout.decode(errors="ignore").lower()
+        return proc.returncode == 0 and (
+            "projectdiscovery" in output
+            or "github.com/projectdiscovery/httpx" in output
+            or re.search(r"\bhttpx\s+v?\d", output) is not None
+        )
 
     def _tool_needed(self, tool: Tool) -> bool:
         if self.no_exploit and tool.name in EXPLOIT_STAGES:
@@ -393,7 +418,11 @@ class Pipeline:
                 self.warn(f"Keine automatische Installation für {tool.display}.")
                 return False
             full_env = os.environ.copy()
-            extra = f"{os.path.expanduser('~/go/bin')}:{os.path.expanduser('~/tools')}"
+            extra = (
+                f"{os.path.expanduser('~/.local/bin')}:"
+                f"{os.path.expanduser('~/go/bin')}:"
+                f"{os.path.expanduser('~/tools')}"
+            )
             full_env["PATH"] = extra + ":" + full_env.get("PATH", "")
             for cmd in steps:
                 self.info(f"Install-Step: {self._cmd_display(cmd)}")
@@ -433,7 +462,7 @@ class Pipeline:
             "paramspider": (
                 "https://github.com/devanshbatham/ParamSpider.git",
                 tools_dir / "ParamSpider",
-                False,
+                True,
             ),
             "xsstrike": (
                 "https://github.com/s0md3v/XSStrike.git",
@@ -452,7 +481,12 @@ class Pipeline:
         steps: List[List[str]] = []
         if not dest.exists():
             steps.append(["git", "clone", "--depth", "1", url, str(dest)])
-        if has_requirements:
+        if tool.name == "paramspider":
+            steps.append([
+                "python3", "-m", "pip", "install", "--quiet", "--user",
+                str(dest),
+            ])
+        elif has_requirements:
             steps.append([
                 "python3", "-m", "pip", "install", "--quiet", "--user",
                 "-r", str(dest / "requirements.txt"),
@@ -464,7 +498,8 @@ class Pipeline:
              stdin_file: Optional[Path] = None,
              stdout_file: Optional[Path] = None,
              timeout: Optional[int] = None,
-             env: Optional[dict] = None) -> Tuple[int, str]:
+             env: Optional[dict] = None,
+             cwd: Optional[Path] = None) -> Tuple[int, str]:
         """Führt einen Befehl aus, leitet optional stdin/stdout in Dateien um."""
         if self.dry:
             self.info(f"[DRY] {self._cmd_display(cmd)}")
@@ -477,17 +512,25 @@ class Pipeline:
         if env:
             full_env.update(env)
         # PATH um ~/go/bin und ~/tools erweitern
-        extra = f"{os.path.expanduser('~/go/bin')}:{os.path.expanduser('~/tools')}"
+        extra = (
+            f"{os.path.expanduser('~/.local/bin')}:"
+            f"{os.path.expanduser('~/go/bin')}:"
+            f"{os.path.expanduser('~/tools')}"
+        )
         full_env["PATH"] = extra + ":" + full_env.get("PATH", "")
 
-        stdin_handle = open(stdin_file, "rb") if stdin_file else None
-        stdout_handle = open(stdout_file, "wb") if stdout_file else None
+        stdin_handle = None
+        stdout_handle = None
 
         try:
+            if cwd:
+                cwd.mkdir(parents=True, exist_ok=True)
+            stdin_handle = open(stdin_file, "rb") if stdin_file else None
+            stdout_handle = open(stdout_file, "wb") if stdout_file else None
             proc = subprocess.run(
                 cmd,
                 stdin=stdin_handle, stdout=stdout_handle, stderr=subprocess.PIPE,
-                timeout=timeout or self.timeout, env=full_env,
+                timeout=timeout or self.timeout, env=full_env, cwd=str(cwd) if cwd else None,
             )
             err_out = proc.stderr.decode(errors="ignore")
             return proc.returncode, err_out
@@ -497,6 +540,9 @@ class Pipeline:
         except FileNotFoundError as e:
             self.err(f"Binary nicht gefunden: {e}")
             return 127, str(e)
+        except OSError as e:
+            self.err(f"Ausführungsfehler: {e}")
+            return 126, str(e)
         finally:
             if stdin_handle: stdin_handle.close()
             if stdout_handle: stdout_handle.close()
@@ -778,17 +824,17 @@ class Pipeline:
             self.warn("ParamSpider-Output existiert bereits.")
             return out
 
+        params_dir = self.out / "params"
         ps_bin = self.binaries["paramspider"]
         cmd = [
-            "python3", ps_bin,
-            "--domain", self.domain,
-            "--exclude", "woff,css,png,jpg,jpeg,svg,gif,ico,woff2,ttf",
-            "--output", str(self.out / "params"),
-            "--level", "high",
+            ps_bin,
+            "-d", self.domain,
         ]
-        rc, err = self._run(cmd, timeout=600)
+        rc, err = self._run(cmd, timeout=600, cwd=params_dir)
+        if rc != 0 and err:
+            self.warn(f"ParamSpider rc={rc}: {err.strip().splitlines()[-1] if err else ''}")
         # ParamSpider schreibt results/<domain>.txt
-        default_out = self.out / "params" / "results" / f"{self.domain}.txt"
+        default_out = params_dir / "results" / f"{self.domain}.txt"
         if default_out.exists():
             self._write(out, self._read(default_out))
         self._stage_result("paramspider", out, cmd, rc)
@@ -867,7 +913,7 @@ class Pipeline:
                     if out_file.exists():
                         with gob_raw.open("a", encoding="utf-8") as fout:
                             fout.write(f"\n# === {host} ===\n")
-                            fout.write(out_file.read_text(errors="ignore"))
+                            fout.write(out_file.read_text(encoding="utf-8", errors="ignore"))
                         out_file.unlink()
                 self._write(gob_out, self._read(gob_raw))
                 stage_rc = 0 if rc_values and all(rc == 0 for rc in rc_values) else 1
@@ -893,7 +939,10 @@ class Pipeline:
                         self.binaries["kiterunner"], "scan",
                         base.group(1),
                         "-w", str(self.kite),
-                        "--json", "-q",
+                        "-o", "json", "-q",
+                        "-x", str(max(1, min(self.threads, 50))),
+                        "-j", "1",
+                        "--fail-status-codes", "400,401,403,404,429,500,501,502,503",
                     ]
                     rc, _ = self._run(cmd, timeout=300, stdout_file=out_file)
                     rc_values.append(rc)
@@ -999,11 +1048,11 @@ class Pipeline:
         subs = self.stage_1_subfinder()
         alive = self.stage_2_httpx(subs)
         urls = self.stage_3_gau_wayback(alive)
-        js_endpoints = self.stage_4_linkfinder(urls)
+        self.stage_4_linkfinder(urls)
         params = self.stage_5_paramspider()
-        arjun = self.stage_6_arjun(params)
-        gob, kr = self.stage_7_bruteforce(alive)
-        xs, sq = self.stage_8_exploits(params, alive)
+        self.stage_6_arjun(params)
+        self.stage_7_bruteforce(alive)
+        self.stage_8_exploits(params, alive)
 
         # Summary
         self._print_summary()
@@ -1083,7 +1132,7 @@ Output landet in:  ./output/<domain>/
                    default=str(Path.home() / "wordlists/directory-list-2.3-medium.txt"),
                    help="Wortliste für Gobuster")
     p.add_argument("--kite",
-                   default=str(Path.home() / "tools/kiterunner-wordlists/large.kite"),
+                   default=str(Path.home() / "tools/kiterunner-wordlists/routes-small.kite"),
                    help="Kiterunner-Wortliste (.kite)")
     p.add_argument("--threads", type=int, default=20,
                    help="Thread-Anzahl für Brute-Force-Stages")
@@ -1127,7 +1176,11 @@ Output landet in:  ./output/<domain>/
         p.error("--linkfinder-workers muss >= 1 sein")
 
     # PATH-Vorbereitung (für Go-Tools ohne 'source ~/.bashrc')
-    extra = f"{os.path.expanduser('~/go/bin')}:{os.path.expanduser('~/tools')}"
+    extra = (
+        f"{os.path.expanduser('~/.local/bin')}:"
+        f"{os.path.expanduser('~/go/bin')}:"
+        f"{os.path.expanduser('~/tools')}"
+    )
     os.environ["PATH"] = extra + ":" + os.environ.get("PATH", "")
 
     try:

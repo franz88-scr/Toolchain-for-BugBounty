@@ -20,7 +20,7 @@ chmod +x install.sh
 source ~/.bashrc
 ```
 
-> Dadurch wird sichergestellt, dass `~/go/bin` im PATH verfügbar ist.
+> Dadurch wird sichergestellt, dass `~/.local/bin`, `~/go/bin` und `~/tools` im PATH verfügbar sind.
 
 ### 3. Pipeline starten
 
@@ -53,7 +53,7 @@ usage: recon.py [-h] -d DOMAIN [-o OUTPUT] [--dry-run] [--force] [--yes]
 | `--skip subfinder,httpx` | Einzelne Stages überspringen |
 | `--only gau,waybackurls` | Nur bestimmte Stages ausführen |
 | `--wordlist FILE` | Eigene Wortliste für Gobuster |
-| `--kite FILE` | Eigene Wortliste für Kiterunner |
+| `--kite FILE` | Eigene `.kite`-Wortliste für Kiterunner (Standard: `~/tools/kiterunner-wordlists/routes-small.kite`) |
 | `--threads N` | Anzahl der Threads für Brute-Force-Stages |
 | `--timeout N` | Globaler Timeout pro Stage in Sekunden |
 | `--rate-limit N` | Rate-Limit für httpx in Requests pro Sekunde (`0` = Tool-Default) |
@@ -166,7 +166,7 @@ recon.py
 │   ├── stage_4_linkfinder()
 │   ├── stage_5_paramspider()
 │   ├── stage_6_arjun()
-│   ├── stage_7_bruteforce()       (parallel)
+│   ├── stage_7_bruteforce()
 │   └── stage_8_exploits()
 │
 └── main()
@@ -209,6 +209,9 @@ cat ./bounty/*/urls/all_urls.txt | sort -u > all_endpoints.txt
 | Problem | Lösung |
 |----------|---------|
 | `command not found: subfinder` | `source ~/.bashrc` oder `export PATH=$PATH:~/go/bin` |
+| `command not found: paramspider` | `source ~/.bashrc` oder `export PATH=$PATH:~/.local/bin`; danach im ParamSpider-Repo `python3 -m pip install --user .` ausführen |
+| `kr` / Kiterunner fehlt | Kiterunner ist optional. `install.sh` installiert Release `v1.0.2`; bei Fehlern läuft die Pipeline mit Gobuster weiter |
+| Kiterunner-Wortliste fehlt | `install.sh` lädt `routes-small.kite` nach `~/tools/kiterunner-wordlists/`; alternativ `--kite /pfad/zur/datei.kite` setzen |
 | `xsstrike.py: not found` | Repository klonen: `git clone https://github.com/s0md3v/XSStrike ~/tools/XSStrike` |
 | Stages dauern sehr lange | `--timeout 600` setzen oder einzelne Stages überspringen |
 | Zu viele Hosts für Brute Force | `--threads 5` und kleinere Wortliste verwenden |
