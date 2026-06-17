@@ -21,8 +21,19 @@ Output-Struktur ab. Es ist KEIN eigenständiges Tool, das die Scan-Logik
 dupliziert - die eigentliche Arbeit macht der Code aus den jeweiligen
 GitHub-Repos (siehe TOOLS-Liste unten).
 
-Autor : Mavis
+Autor : franz88-scr
 Lizenz: Nur für autorisierte Bug-Bounty-/Pentest-Targets.
+
+Changelog (gegenüber v1):
+  • Bugfix: Tool-Lookup normalisiert auf lowercase-Keys (KeyError in Stage 6/7 behoben)
+  • Bugfix: sqlmap-Output wird jetzt tatsächlich geschrieben und gemerged
+  • Bugfix: --dry-run führt keine echten Install-Befehle mehr aus
+  • Verbesserung: LinkFinder läuft parallel statt seriell
+  • Verbesserung: bessere Hostname-Extraktion aus httpx-Output
+  • Verbesserung: gau-extra nutzt --list statt vieler CLI-Argumente
+  • Verbesserung: Kiterunner respektiert --skip
+  • Verbesserung: defensive Checks in allen Stages (kein KeyError bei übersprungenen Tools)
+  • Verbesserung: Tempfiles via uuid statt hash() (kollisionsfrei, deterministisch lesbar)
 ================================================================================
 """
 
@@ -36,11 +47,13 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 # =============================================================================
 #  ANSI-Farben (deaktivieren, wenn nicht TTY)
@@ -55,84 +68,108 @@ class C:
 if not sys.stdout.isatty():
     C.disable()
 
+
 # =============================================================================
-#  Tool-Registry (alle Quellen verweisen auf die offiziellen GitHub-Repos)
+#  Tool-Registry
+#
+#  name          : canonicaler Lookup-Key (lowercase). Wird in self.binaries genutzt.
+#  display       : menschenlesbarer Name für Print-Ausgabe.
+#  binary        : Binary-Name, das in PATH gesucht wird (shutil.which).
+#  path_override : absoluter Pfad zum Binary, falls nicht in PATH installiert.
+#  required      : True → Pipeline bricht ab, wenn das Tool fehlt.
 # =============================================================================
-@dataclass
+@dataclass(frozen=True)
 class Tool:
     name: str
+    display: str
     github: str
-    binary: str                       # Binary/Pfad, das im Skript geprüft wird
-    install_cmd: str                   # Empfohlener Install-Befehl
+    binary: str
+    install_cmd: str
     kind: str                          # go | pip | git | binary
-    required: bool = True              # Muss vorhanden sein, sonst Abbruch?
-    path_override: str = ""            # Absoluter Pfad, falls nicht im PATH
+    required: bool = True
+    path_override: str = ""
+
 
 TOOLS: List[Tool] = [
-    Tool("subfinder",    "https://github.com/projectdiscovery/subfinder",
+    Tool("subfinder",   "subfinder",
+         "https://github.com/projectdiscovery/subfinder",
          "subfinder",
          "go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest",
          "go"),
 
-    Tool("httpx",        "https://github.com/projectdiscovery/httpx",
+    Tool("httpx",       "httpx",
+         "https://github.com/projectdiscovery/httpx",
          "httpx",
          "go install github.com/projectdiscovery/httpx/cmd/httpx@latest",
          "go"),
 
-    Tool("gau",          "https://github.com/lc/gau",
+    Tool("gau",         "gau",
+         "https://github.com/lc/gau",
          "gau",
          "go install github.com/lc/gau/v2/cmd/gau@latest",
          "go"),
 
-    Tool("waybackurls",  "https://github.com/tomnomnom/waybackurls",
+    Tool("waybackurls", "waybackurls",
+         "https://github.com/tomnomnom/waybackurls",
          "waybackurls",
          "go install github.com/tomnomnom/waybackurls@latest",
          "go"),
 
-    Tool("LinkFinder",   "https://github.com/GerbenJavado/LinkFinder",
+    Tool("linkfinder",  "LinkFinder",
+         "https://github.com/GerbenJavado/LinkFinder",
          "linkfinder.py",
-         "git clone https://github.com/GerbenJavado/LinkFinder.git ~/tools/LinkFinder && "
-         "pip install -r ~/tools/LinkFinder/requirements.txt",
+         "git clone https://github.com/GerbenJavado/LinkFinder.git "
+         "$HOME/tools/LinkFinder && pip install -r $HOME/tools/LinkFinder/requirements.txt",
          "git",
          path_override=str(Path.home() / "tools/LinkFinder/linkfinder.py")),
 
-    Tool("ParamSpider",  "https://github.com/devanshbatham/ParamSpider",
+    Tool("paramspider", "ParamSpider",
+         "https://github.com/devanshbatham/ParamSpider",
          "paramspider.py",
-         "git clone https://github.com/devanshbatham/ParamSpider.git ~/tools/ParamSpider",
+         "git clone https://github.com/devanshbatham/ParamSpider.git $HOME/tools/ParamSpider",
          "git",
          path_override=str(Path.home() / "tools/ParamSpider/paramspider.py")),
 
-    Tool("Arjun",        "https://github.com/s0md3v/Arjun",
+    Tool("arjun",       "Arjun",
+         "https://github.com/s0md3v/Arjun",
          "arjun",
          "pip install arjun",
          "pip"),
 
-    Tool("Gobuster",     "https://github.com/OJ/gobuster",
+    Tool("gobuster",    "Gobuster",
+         "https://github.com/OJ/gobuster",
          "gobuster",
          "go install github.com/OJ/gobuster/v3@latest",
          "go"),
 
-    Tool("Kiterunner",   "https://github.com/assetnote/kiterunner",
+    Tool("kiterunner",  "Kiterunner",
+         "https://github.com/assetnote/kiterunner",
          "kr",
          "siehe install.sh (Binary-Release von GitHub)",
          "binary",
-         required=False),  # Gobuster ist Alternative
+         required=False),  # optional, Gobuster ist Alternative
 
-    Tool("XSStrike",     "https://github.com/s0md3v/XSStrike",
+    Tool("xsstrike",    "XSStrike",
+         "https://github.com/s0md3v/XSStrike",
          "xsstrike.py",
-         "git clone https://github.com/s0md3v/XSStrike.git ~/tools/XSStrike && "
-         "pip install -r ~/tools/XSStrike/requirements.txt",
+         "git clone https://github.com/s0md3v/XSStrike.git "
+         "$HOME/tools/XSStrike && pip install -r $HOME/tools/XSStrike/requirements.txt",
          "git",
-         required=False,   # Exploit-Tools – bestätigungspflichtig
+         required=False,   # Exploit-Tool – bestätigungspflichtig
          path_override=str(Path.home() / "tools/XSStrike/xsstrike.py")),
 
-    Tool("sqlmap",       "https://github.com/sqlmapproject/sqlmap",
-         "sqlmap",
-         "git clone https://github.com/sqlmapproject/sqlmap.git ~/tools/sqlmap",
+    Tool("sqlmap",      "sqlmap",
+         "https://github.com/sqlmapproject/sqlmap",
+         "sqlmap.py",
+         "git clone https://github.com/sqlmapproject/sqlmap.git $HOME/tools/sqlmap",
          "git",
-         required=False,   # Exploit-Tools – bestätigungspflichtig
+         required=False,   # Exploit-Tool – bestätigungspflichtig
          path_override=str(Path.home() / "tools/sqlmap/sqlmap.py")),
 ]
+
+# Lookup-Map für schnellen Zugriff nach name (lowercase)
+TOOL_BY_NAME: Dict[str, Tool] = {t.name: t for t in TOOLS}
+
 
 # =============================================================================
 #  Pipeline-Klasse
@@ -147,12 +184,16 @@ class Pipeline:
         f"╚══════════════════════════════════════════════════════════════╝{C.N}"
     )
 
+    # Max. Hosts, gegen die Brute-Force / Exploits laufen sollen
+    BRUTEFORCE_HOST_LIMIT = 5
+    EXPLOIT_TARGET_LIMIT = 20
+
     def __init__(self, args: argparse.Namespace):
         self.domain: str = args.domain
         self.out: Path = Path(args.output).expanduser().resolve()
         self.dry: bool = args.dry_run
-        self.skip: set = set(s.lower() for s in (args.skip or []))
-        self.only: set = set(s.lower() for s in (args.only or []))
+        self.skip: Set[str] = set(s.lower() for s in (args.skip or []))
+        self.only: Set[str] = set(s.lower() for s in (args.only or []))
         self.wordlist: Path = Path(args.wordlist).expanduser()
         self.kite: Path = Path(args.kite).expanduser()
         self.no_exploit: bool = args.no_exploit
@@ -160,6 +201,9 @@ class Pipeline:
         self.timeout: int = args.timeout
         self.yes: bool = args.yes
         self.force: bool = args.force
+        self.rate_limit: int = args.rate_limit
+        self.linkfinder_workers: int = args.linkfinder_workers
+
         self.results: Dict[str, dict] = {}
         self.binaries: Dict[str, str] = {}    # name → resolved path
         self.start_time = time.time()
@@ -175,7 +219,8 @@ class Pipeline:
     def log(self, msg: str) -> None:
         print(msg)
         with open(self._logfile(), "a", encoding="utf-8") as f:
-            f.write(msg + "\n")
+            # ANSI-Escapes aus dem Logfile raus halten
+            f.write(_ANSI_RE.sub("", msg) + "\n")
 
     def info(self, m): self.log(f"{C.CY}[*]{C.N} {m}")
     def ok(self, m):   self.log(f"{C.G}[+]{C.N} {m}")
@@ -188,9 +233,8 @@ class Pipeline:
         if not p.exists(): return []
         return [l.strip() for l in p.read_text(errors="ignore").splitlines() if l.strip()]
 
-    def _write(self, p: Path, lines: List[str]) -> None:
+    def _write(self, p: Path, lines: Sequence[str]) -> None:
         p.parent.mkdir(parents=True, exist_ok=True)
-        # Deduplizieren und sortieren
         uniq = sorted(set(l.strip() for l in lines if l.strip()))
         p.write_text("\n".join(uniq) + ("\n" if uniq else ""))
 
@@ -201,7 +245,13 @@ class Pipeline:
     def _resolve(self, tool: Tool) -> Optional[str]:
         if tool.path_override:
             p = Path(os.path.expanduser(tool.path_override))
-            if p.exists(): return str(p)
+            if p.exists():
+                return str(p)
+            # Fallback: wenn path_override definiert ist, aber Datei fehlt,
+            # versuchen wir es trotzdem in PATH (z. B. bei custom install path).
+            found = shutil.which(tool.binary)
+            if found:
+                return found
             return None
         return shutil.which(tool.binary)
 
@@ -214,53 +264,73 @@ class Pipeline:
             except EOFError:
                 return default_yes
             if not ans: return default_yes
-            if ans in ("j","ja","y","yes"): return True
-            if ans in ("n","nein","no"): return False
+            if ans in ("j", "ja", "y", "yes"): return True
+            if ans in ("n", "nein", "no"): return False
 
     def _prompt_choice(self, q: str, options: List[str]) -> str:
-        """Fragt ab, gibt das gewählte Element aus options zurück (oder 'q')."""
         opts = "/".join(options + ["q=quit"])
         while True:
             try:
                 ans = input(f"{C.Y}?{C.N} {q} ({opts}): ").strip().lower()
             except EOFError:
                 return "q"
-            if ans in ("q","quit","exit"): return "q"
+            if ans in ("q", "quit", "exit"): return "q"
             if ans in options: return ans
             print(f"  {C.DIM}bitte eine der Optionen: {opts}{C.N}")
+
+    def _have(self, name: str) -> bool:
+        """True, wenn Tool vorhanden UND der Stage-Skip nicht aktiv ist."""
+        if name not in self.binaries:
+            return False
+        if not self._should_run(name):
+            return False
+        return True
 
     def check_dependencies(self) -> bool:
         """Prüft alle Tools, fragt interaktiv bei fehlenden nach Aktion."""
         self.head("Prüfe Tool-Verfügbarkeit")
         missing_required: List[Tool] = []
+        missing_optional: List[Tool] = []
 
         for tool in TOOLS:
             path = self._resolve(tool)
             if path:
                 self.binaries[tool.name] = path
-                self.ok(f"{tool.name:14s} → {C.DIM}{path}{C.N}")
+                self.ok(f"{tool.display:14s} → {C.DIM}{path}{C.N}")
             else:
-                self.err(f"{tool.name:14s} → NICHT GEFUNDEN  {C.DIM}({tool.github}){C.N}")
+                tag = "PFLICHT" if tool.required else "optional"
+                self.err(f"{tool.display:14s} → NICHT GEFUNDEN  "
+                         f"[{tag}]  {C.DIM}({tool.github}){C.N}")
                 if tool.required:
                     missing_required.append(tool)
+                else:
+                    missing_optional.append(tool)
 
         # Interaktive Nachfrage für jedes fehlende Tool
-        for tool in TOOLS:
+        for tool in list(missing_required) + missing_optional:
             if tool.name in self.binaries:
                 continue
-            self.warn(f"\nFehlt: {tool.name}")
+            self.warn(f"\nFehlt: {tool.display}")
             self.log(f"    Quelle:    {tool.github}")
             self.log(f"    Install:   {tool.install_cmd}")
 
-            # Bei --yes: für required → install versuchen, sonst skip
+            if self.dry:
+                # Dry-Run darf das System nicht verändern.
+                self.info(f"[DRY] würde {tool.display} installieren wollen, "
+                          f"überspringe im Dry-Run.")
+                if tool.required:
+                    missing_required.append(tool)
+                continue
+
             if self.yes:
                 choice = "install" if tool.required else "skip"
                 self.info(f"--yes aktiv → automatische Wahl: {choice}")
             else:
                 choice = self._prompt_choice(
-                    f"Was tun mit '{tool.name}'?",
+                    f"Was tun mit '{tool.display}'?",
                     ["install", "skip", "abort"]
                 )
+
             if choice == "abort":
                 self.err("Abbruch auf Wunsch des Users.")
                 return False
@@ -270,40 +340,44 @@ class Pipeline:
                     path = self._resolve(tool)
                     if path:
                         self.binaries[tool.name] = path
-                        self.ok(f"{tool.name} jetzt verfügbar: {path}")
+                        self.ok(f"{tool.display} jetzt verfügbar: {path}")
                     else:
-                        self.warn(f"{tool.name} wurde installiert, aber nicht im PATH/Pfad gefunden.")
+                        self.warn(f"{tool.display} wurde installiert, "
+                                  f"aber nicht im PATH/Pfad gefunden.")
                         if tool.required:
                             missing_required.append(tool)
                 else:
-                    self.err(f"Installation von {tool.name} fehlgeschlagen.")
+                    self.err(f"Installation von {tool.display} fehlgeschlagen.")
                     if tool.required:
                         missing_required.append(tool)
             elif choice == "skip":
-                self.warn(f"Überspringe {tool.name}.")
+                self.warn(f"Überspringe {tool.display}.")
                 if tool.required:
                     missing_required.append(tool)
 
         if missing_required:
-            self.err(f"\nFehlende Pflicht-Tools: {[t.name for t in missing_required]}")
+            self.err(f"\nFehlende Pflicht-Tools: "
+                     f"{[t.display for t in missing_required]}")
             return False
         return True
 
     def _try_install(self, tool: Tool) -> bool:
         """Versucht, ein Tool zu installieren. Gibt True bei Erfolg zurück."""
-        self.info(f"Versuche {tool.name} zu installieren: {tool.install_cmd}")
+        self.info(f"Versuche {tool.display} zu installieren: {tool.install_cmd}")
         try:
-            # Bei 'git clone' brauchen wir kein sudo; bei 'go install' meistens auch nicht
             shell_cmd = tool.install_cmd
-            if tool.kind in ("pip",) and "pip install" in shell_cmd:
-                shell_cmd = shell_cmd.replace("pip install",
-                    "python3 -m pip install --quiet --break-system-packages")
+            if tool.kind == "pip" and "pip install" in shell_cmd:
+                shell_cmd = shell_cmd.replace(
+                    "pip install",
+                    "python3 -m pip install --quiet --break-system-packages",
+                )
             proc = subprocess.run(
                 shell_cmd, shell=True,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 timeout=600,
             )
-            self.log(f"{C.DIM}    {proc.stdout.decode(errors='ignore')[-500:]}{C.N}")
+            self.log(f"{C.DIM}    "
+                     f"{proc.stdout.decode(errors='ignore')[-500:]}{C.N}")
             return proc.returncode == 0
         except Exception as e:
             self.err(f"Installations-Fehler: {e}")
@@ -314,8 +388,7 @@ class Pipeline:
              stdin_file: Optional[Path] = None,
              stdout_file: Optional[Path] = None,
              timeout: Optional[int] = None,
-             env: Optional[dict] = None,
-             check: bool = False) -> Tuple[int, str]:
+             env: Optional[dict] = None) -> Tuple[int, str]:
         """Führt einen Befehl aus, leitet optional stdin/stdout in Dateien um."""
         if self.dry:
             self.info(f"[DRY] {' '.join(cmd)}")
@@ -325,8 +398,9 @@ class Pipeline:
             stdout_file.parent.mkdir(parents=True, exist_ok=True)
 
         full_env = os.environ.copy()
-        if env: full_env.update(env)
-        # PATH um ~/go/bin und ~/tools/* erweitern
+        if env:
+            full_env.update(env)
+        # PATH um ~/go/bin und ~/tools erweitern
         extra = f"{os.path.expanduser('~/go/bin')}:{os.path.expanduser('~/tools')}"
         full_env["PATH"] = extra + ":" + full_env.get("PATH", "")
 
@@ -352,28 +426,46 @@ class Pipeline:
             if stdout_handle: stdout_handle.close()
 
     def _should_run(self, stage: str) -> bool:
+        stage = stage.lower()
         if self.only:
-            return stage.lower() in self.only
+            return stage in self.only
         if self.skip:
-            return stage.lower() not in self.skip
+            return stage not in self.skip
         return True
 
     def _stage_result(self, name: str, output: Path, cmd: List[str], rc: int) -> None:
         cnt = self._count(output) if output.exists() else 0
         self.results[name] = {
-            "output": str(output), "lines": cnt, "command": " ".join(cmd), "rc": rc,
+            "output": str(output),
+            "lines": cnt,
+            "command": " ".join(cmd),
+            "rc": rc,
         }
         badge = f"{C.G}OK{C.N}" if rc == 0 else f"{C.Y}RC={rc}{C.N}"
-        self.ok(f"Stage {name}: {cnt} Einträge in {output.relative_to(self.out)} [{badge}]")
+        self.ok(f"Stage {name}: {cnt} Einträge in "
+                f"{output.relative_to(self.out)} [{badge}]")
+
+    @staticmethod
+    def _uid() -> str:
+        """Kurze, deterministisch-pro-Run eindeutige ID für Temp-Files."""
+        return uuid.uuid4().hex[:10]
 
     # ========================================================================
     #  STAGES
     # ========================================================================
     def stage_1_subfinder(self) -> Path:
         self.head("Stage 1/8: subfinder  (Subdomain-Enumeration)")
+        if not self._should_run("subfinder"):
+            self.warn("subfinder übersprungen (--skip/--only).")
+            return self.out / "subs" / "subfinder.txt"
+        if "subfinder" not in self.binaries:
+            self.err("subfinder nicht verfügbar – Stage übersprungen.")
+            return self.out / "subs" / "subfinder.txt"
+
         out = self.out / "subs" / "subfinder.txt"
-        if out.exists() and not self.force:
-            self.warn(f"Output existiert bereits ({self._count(out)} subs). --force zum Neu-Run.")
+        if out.exists() and self._count(out) > 0 and not self.force:
+            self.warn(f"Output existiert bereits ({self._count(out)} subs). "
+                      f"--force zum Neu-Run.")
             return out
         cmd = [self.binaries["subfinder"], "-d", self.domain, "-all", "-silent"]
         rc, err = self._run(cmd, stdout_file=out)
@@ -384,60 +476,94 @@ class Pipeline:
 
     def stage_2_httpx(self, subs_file: Path) -> Path:
         self.head("Stage 2/8: httpx  (HTTP-Probing / lebende Hosts)")
+        if not self._should_run("httpx"):
+            self.warn("httpx übersprungen (--skip/--only).")
+            return self.out / "subs" / "alive.txt"
+
         out = self.out / "subs" / "alive.txt"
         if not subs_file.exists() or self._count(subs_file) == 0:
             self.warn("Keine Subdomains – überspringe httpx.")
             return out
         if out.exists() and self._count(out) > 0 and not self.force:
-            self.warn(f"Output existiert bereits. --force zum Neu-Run.")
+            self.warn("Output existiert bereits. --force zum Neu-Run.")
             return out
+
         cmd = [
-            self.binaries["httpx"], "-l", str(subs_file),
+            self.binaries.get("httpx", "httpx"),
+            "-l", str(subs_file),
             "-silent", "-follow-redirects",
             "-status-code", "-title", "-tech-detect",
             "-o", str(out),
         ]
+        if self.rate_limit > 0:
+            cmd += ["-rate-limit", str(self.rate_limit)]
         rc, err = self._run(cmd)
         if rc != 0 and err:
             self.warn(err.strip().splitlines()[-1] if err else "")
         self._stage_result("httpx", out, cmd, rc)
         return out
 
+    @staticmethod
+    def _extract_host(line: str) -> Optional[str]:
+        """Extrahiert einen Hostnamen aus einer Zeile.
+
+        Funktioniert sowohl mit reinen URL-Zeilen (httpx -o Format) als auch
+        mit dem ausführlichen httpx-Output "https://host [200] [Title]".
+        """
+        m = re.match(r"https?://([^/\s\[]+)", line)
+        return m.group(1) if m else None
+
     def stage_3_gau_wayback(self, alive_file: Path) -> Path:
         """gau und waybackurls laufen PARALLEL und werden gemerged."""
         self.head("Stage 3/8: gau + waybackurls  (URL-Harvesting, parallel)")
+        if not self._should_run("gau") and not self._should_run("waybackurls"):
+            self.warn("gau+waybackurls übersprungen (--skip/--only).")
+            return self.out / "urls" / "all_urls.txt"
+
         out = self.out / "urls" / "all_urls.txt"
         gau_raw = self.out / "urls" / "gau.txt"
         wb_raw = self.out / "urls" / "wayback.txt"
+        extra_raw = self.out / "urls" / "gau_extra.txt"
 
         if out.exists() and self._count(out) > 0 and not self.force:
             self.warn(f"Output existiert bereits ({self._count(out)} URLs).")
             return out
 
-        def run_gau():
-            cmd = [self.binaries["gau"], "--subs", self.domain, "--threads", "5"]
-            return ("gau", cmd, gau_raw)
+        jobs: List[Tuple[str, List[str], Path]] = []
 
-        def run_wb():
-            cmd = [self.binaries["waybackurls"], self.domain]
-            return ("waybackurls", cmd, wb_raw)
+        if self._should_run("gau") and "gau" in self.binaries:
+            jobs.append(("gau",
+                         [self.binaries["gau"], "--subs", self.domain,
+                          "--threads", "5"],
+                         gau_raw))
+        if self._should_run("waybackurls") and "waybackurls" in self.binaries:
+            jobs.append(("waybackurls",
+                         [self.binaries["waybackurls"], self.domain],
+                         wb_raw))
 
-        # Optional: zusätzlich mit jeder lebenden Domain aus alive_file
-        # → waybackurls/gau akzeptieren aber Domain, nicht URL; daher nur Hauptdomain.
-        jobs = [run_gau(), run_wb()]
-
-        # Falls alive-Datei URLs enthält, gau auch gegen diese laufen lassen
-        if alive_file.exists() and self._count(alive_file) > 0:
-            extra_hosts = self.out / "urls" / "gau_extra.txt"
-            hosts = set()
-            for line in self._read(alive_file):
-                m = re.match(r"https?://([^/]+)", line)
-                if m: hosts.add(m.group(1))
+        # Zusätzlich: gau gegen jeden gefundenen lebenden Host.
+        # Wir schreiben die Hostliste in eine Temp-Datei und nutzen
+        # `gau --list` (vermeidet ARG_MAX-Probleme bei vielen Hosts).
+        if (self._should_run("gau") and "gau" in self.binaries
+                and alive_file.exists() and self._count(alive_file) > 0):
+            hosts = sorted({
+                h for h in (self._extract_host(line) for line in self._read(alive_file))
+                if h and h != self.domain
+            })
             if hosts:
-                cmd = [self.binaries["gau"], "--subs"] + sorted(hosts) + ["--threads", "5"]
-                jobs.append(("gau-extra", cmd, extra_hosts))
+                host_list = self.out / "urls" / "_gau_hosts.txt"
+                host_list.write_text("\n".join(hosts) + "\n")
+                jobs.append(("gau-extra",
+                             [self.binaries["gau"], "--subs",
+                              "--list", str(host_list),
+                              "--threads", "5"],
+                             extra_raw))
             else:
-                self.warn("Keine Hostnamen aus alive.txt extrahierbar – gau-extra entfällt.")
+                self.warn("Keine zusätzlichen Hostnamen – gau-extra entfällt.")
+
+        if not jobs:
+            self.warn("Keine URL-Harvesting-Tools verfügbar – Stage leer.")
+            return out
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as ex:
             futures = {ex.submit(self._run, cmd, stdout_file=outf, timeout=300):
@@ -452,28 +578,44 @@ class Pipeline:
 
         # Mergen + dedup
         merged: List[str] = []
-        for f in [gau_raw, wb_raw, self.out / "urls" / "gau_extra.txt"]:
+        for f in [gau_raw, wb_raw, extra_raw]:
             if f.exists():
                 merged.extend(self._read(f))
         self._write(out, merged)
         self.ok(f"Total nach Merge + Dedup: {self._count(out)} unique URLs")
         return out
 
+    # Matcht .js-URLs, optional mit Query-String, schließt .map / .min.map.js aus.
+    _JS_URL_RE = re.compile(
+        r"https?://[^\s\"'<>)]+?\.js(?:\?[^\s\"'<>)]*)?$",
+        re.IGNORECASE,
+    )
+
     def stage_4_linkfinder(self, urls_file: Path) -> Path:
         self.head("Stage 4/8: LinkFinder  (JS-Endpoints extrahieren)")
-        js_files = self.out / "js" / "js_files.txt"
+        if not self._should_run("linkfinder"):
+            self.warn("LinkFinder übersprungen (--skip/--only).")
+            return self.out / "js" / "endpoints.txt"
+        if "linkfinder" not in self.binaries:
+            self.err("LinkFinder nicht verfügbar – Stage übersprungen.")
+            return self.out / "js" / "endpoints.txt"
+
+        js_files_out = self.out / "js" / "js_files.txt"
         out = self.out / "js" / "endpoints.txt"
 
         if not urls_file.exists() or self._count(urls_file) == 0:
             self.warn("Keine URLs – überspringe LinkFinder.")
             return out
 
-        # 1) JS-Dateien aus URLs extrahieren
-        js_urls: set = set()
+        # 1) JS-Dateien aus URLs extrahieren (Query-Strings toleriert, .map ausgeschlossen)
+        js_urls: Set[str] = set()
         for line in self._read(urls_file):
-            for m in re.findall(r"https?://[^\s\"'<>]+\.js", line, re.IGNORECASE):
+            for m in self._JS_URL_RE.findall(line):
+                low = m.lower()
+                if low.endswith(".map") or low.endswith(".map.js") or ".map?" in low:
+                    continue
                 js_urls.add(m)
-        self._write(js_files, list(js_urls))
+        self._write(js_files_out, list(js_urls))
         self.info(f"{len(js_urls)} eindeutige .js-Dateien gefunden")
 
         if not js_urls:
@@ -484,32 +626,80 @@ class Pipeline:
             self.warn("LinkFinder-Output existiert bereits.")
             return out
 
-        # 2) LinkFinder pro JS-URL aufrufen, parsen
-        # LinkFinder CLI: python linkfinder.py -i <url|file> -o <out.html>
-        # Wir parsen die HTML-Ausgabe nach Endpoints.
-        lf_bin = self.binaries["LinkFinder"]
-        all_endpoints: List[str] = []
-        for js in js_urls:
-            tmp_html = self.out / "js" / f"_lf_{abs(hash(js))}.html"
-            cmd = ["python3", lf_bin, "-i", js, "-o", str(tmp_html)]
-            rc, err = self._run(cmd, timeout=120)
-            if rc == 0 and tmp_html.exists():
-                # Endpoints aus HTML kratzen: jede Zeile mit http(s) ist ein Endpoint
-                eps = re.findall(r"https?://[^\s\"'<>]+", tmp_html.read_text(errors="ignore"))
-                all_endpoints.extend(eps)
-            tmp_html.unlink(missing_ok=True)
+        # 2) LinkFinder pro JS-URL aufrufen, HTML-Output parsen.
+        #    Parallel statt seriell – bei SPAs mit 100+ JS-Files ein riesiger Unterschied.
+        lf_bin = self.binaries["linkfinder"]
+        tmp_dir = self.out / "js" / "_lf_tmp"
+        tmp_dir.mkdir(exist_ok=True)
 
-        self._write(out, all_endpoints)
+        endpoints: List[str] = []
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.linkfinder_workers
+        ) as ex:
+            future_to_url = {
+                ex.submit(self._run_linkfinder, lf_bin, js, tmp_dir): js
+                for js in js_urls
+            }
+            for fut in concurrent.futures.as_completed(future_to_url):
+                js = future_to_url[fut]
+                try:
+                    eps = fut.result()
+                    endpoints.extend(eps)
+                except Exception as e:
+                    self.warn(f"LinkFinder-Fehler bei {js}: {e}")
+
+        # tmp_html-Files aufräumen
+        for f in tmp_dir.glob("*.html"):
+            f.unlink(missing_ok=True)
+        try:
+            tmp_dir.rmdir()
+        except OSError:
+            pass
+
+        self._write(out, endpoints)
         self._stage_result("linkfinder", out, ["linkfinder"], 0)
         return out
 
+    # Regex für saubere Endpoint-Extraktion aus LinkFinder-HTML.
+    # LinkFinder nutzt sowohl <a href="..."> als auch <li class="...">text</li>.
+    _LF_HREF_RE = re.compile(r"""<a[^>]+href=["'](https?://[^"']+)["']""", re.IGNORECASE)
+    _LF_LI_RE = re.compile(r"""<li[^>]*>\s*([^\s<][^\s<]*)""", re.IGNORECASE)
+
+    def _run_linkfinder(self, lf_bin: str, js_url: str, tmp_dir: Path) -> List[str]:
+        """Führt LinkFinder für eine JS-URL aus und gibt gefundene Endpoints zurück."""
+        tmp_html = tmp_dir / f"lf_{self._uid()}.html"
+        cmd = ["python3", lf_bin, "-i", js_url, "-o", str(tmp_html)]
+        rc, _ = self._run(cmd, timeout=120)
+        if rc != 0 or not tmp_html.exists():
+            return []
+        try:
+            html = tmp_html.read_text(errors="ignore")
+        finally:
+            tmp_html.unlink(missing_ok=True)
+        # Saubere Endpoint-Extraktion: nur <a href> und <li>-Inhalte.
+        endpoints: Set[str] = set()
+        endpoints.update(self._LF_HREF_RE.findall(html))
+        for li in self._LF_LI_RE.findall(html):
+            # Nur pfad- oder URL-ähnliche Li-Inhalte
+            if li.startswith("/") or li.startswith("http"):
+                endpoints.add(li)
+        return list(endpoints)
+
     def stage_5_paramspider(self) -> Path:
         self.head("Stage 5/8: ParamSpider  (URLs mit Parametern)")
+        if not self._should_run("paramspider"):
+            self.warn("ParamSpider übersprungen (--skip/--only).")
+            return self.out / "params" / "paramspider.txt"
+        if "paramspider" not in self.binaries:
+            self.err("ParamSpider nicht verfügbar – Stage übersprungen.")
+            return self.out / "params" / "paramspider.txt"
+
         out = self.out / "params" / "paramspider.txt"
         if out.exists() and self._count(out) > 0 and not self.force:
             self.warn("ParamSpider-Output existiert bereits.")
             return out
-        ps_bin = self.binaries["ParamSpider"]
+
+        ps_bin = self.binaries["paramspider"]
         cmd = [
             "python3", ps_bin,
             "--domain", self.domain,
@@ -527,6 +717,13 @@ class Pipeline:
 
     def stage_6_arjun(self, params_file: Path) -> Path:
         self.head("Stage 6/8: Arjun  (versteckte Parameter entdecken)")
+        if not self._should_run("arjun"):
+            self.warn("Arjun übersprungen (--skip/--only).")
+            return self.out / "arjun" / "arjun.json"
+        if "arjun" not in self.binaries:
+            self.err("Arjun nicht verfügbar – Stage übersprungen.")
+            return self.out / "arjun" / "arjun.json"
+
         out = self.out / "arjun" / "arjun.json"
         if not params_file.exists() or self._count(params_file) == 0:
             self.warn("Keine parametrisierten URLs – überspringe Arjun.")
@@ -535,20 +732,16 @@ class Pipeline:
             self.warn("Arjun-Output existiert bereits.")
             return out
 
-        # Arjun kann -i <file> (Liste URLs) verwenden
+        # Arjun kennt kein --passive. Nur --stable ist ein gängiges Stabilitäts-Flag.
         cmd = [
             self.binaries["arjun"],
             "-i", str(params_file),
             "-oJ", str(out),
-            "--stable", "--passive",
+            "--stable",
         ]
         rc, err = self._run(cmd, timeout=900)
         if rc != 0 and err:
-            # Fallback: ohne --passive
-            self.warn("Fallback: Arjun ohne --passive")
-            cmd = [self.binaries["arjun"], "-i", str(params_file),
-                   "-oJ", str(out), "--stable"]
-            rc, err = self._run(cmd, timeout=900)
+            self.warn(f"Arjun rc={rc}: {err.strip().splitlines()[-1] if err else ''}")
         self._stage_result("arjun", out, cmd, rc)
         return out
 
@@ -562,54 +755,57 @@ class Pipeline:
             self.warn("Keine lebenden Hosts – überspringe Bruteforce.")
             return gob_out, kr_out
 
-        # Wir nehmen die ersten N Hosts, um nicht ausufernd zu werden
+        # Defensive: nur die ersten N Hosts, um nicht ausufernd zu werden
         alive_lines_all = self._read(alive_file)
-        alive_lines = alive_lines_all[: max(1, min(5, len(alive_lines_all)))]
+        alive_lines = alive_lines_all[: max(1, min(self.BRUTEFORCE_HOST_LIMIT,
+                                                  len(alive_lines_all)))]
         self.info(f"Bruteforce gegen {len(alive_lines)} Hosts")
 
-        # Gobuster
-        if self._should_run("gobuster") and "Gobuster" in self.binaries:
+        # --- Gobuster ---
+        if self._have("gobuster"):
             gob_raw = self.out / "bruteforce" / "gobuster_raw.txt"
             gob_raw.unlink(missing_ok=True)
-            with open(gob_raw, "a") as fout:
-                for host in alive_lines:
-                    base = re.match(r"(https?://[^/]+)", host)
-                    if not base: continue
-                    cmd = [
-                        self.binaries["gobuster"], "dir",
-                        "-u", base.group(1),
-                        "-w", str(self.wordlist),
-                        "-q", "-t", str(self.threads),
-                        "-o", str(self.out / "bruteforce" / f"gob_{abs(hash(host))}.txt"),
-                        "-b", "404,403",
-                    ]
-                    rc, _ = self._run(cmd, timeout=600)
-                    # Outputs sammeln
-                    single = self.out / "bruteforce" / f"gob_{abs(hash(host))}.txt"
-                    if single.exists():
+            for host in alive_lines:
+                base = re.match(r"(https?://[^/]+)", host)
+                if not base:
+                    continue
+                out_file = self.out / "bruteforce" / f"gob_{self._uid()}.txt"
+                cmd = [
+                    self.binaries["gobuster"], "dir",
+                    "-u", base.group(1),
+                    "-w", str(self.wordlist),
+                    "-q", "-t", str(self.threads),
+                    "-o", str(out_file),
+                    "-b", "404,403",
+                ]
+                rc, _ = self._run(cmd, timeout=600)
+                if out_file.exists():
+                    with gob_raw.open("a") as fout:
                         fout.write(f"\n# === {host} ===\n")
-                        fout.write(single.read_text())
-                        single.unlink()
+                        fout.write(out_file.read_text())
+                    out_file.unlink()
             self._write(gob_out, self._read(gob_raw))
             self._stage_result("gobuster", gob_out, ["gobuster"], 0)
         else:
             self.warn("Gobuster übersprungen / nicht verfügbar.")
 
-        # Kiterunner (optional, falls vorhanden)
-        if "Kiterunner" in self.binaries and self.binaries["Kiterunner"]:
-            kr_raw = self.out / "bruteforce" / "kr_raw.json"
+        # --- Kiterunner (optional) ---
+        # ACHTUNG: respektiert jetzt --skip/--only (Bugfix v2).
+        if self._have("kiterunner"):
+            kr_raw = self.out / "bruteforce" / "kiterunner.json"
             kr_raw.unlink(missing_ok=True)
             for host in alive_lines:
                 base = re.match(r"(https?://[^/]+)", host)
-                if not base: continue
+                if not base:
+                    continue
+                out_file = self.out / "bruteforce" / f"kr_{self._uid()}.json"
                 cmd = [
-                    self.binaries["Kiterunner"], "scan",
+                    self.binaries["kiterunner"], "scan",
                     base.group(1),
                     "-w", str(self.kite),
                     "--json", "-q",
                 ]
-                rc, _ = self._run(cmd, timeout=300,
-                                  stdout_file=kr_raw.with_name(f"kr_{abs(hash(host))}.json"))
+                rc, _ = self._run(cmd, timeout=300, stdout_file=out_file)
             # Merge aller KR-JSONs
             merged: List[str] = []
             for f in (self.out / "bruteforce").glob("kr_*.json"):
@@ -619,7 +815,7 @@ class Pipeline:
             self._write(kr_out, merged)
             self._stage_result("kiterunner", kr_out, ["kiterunner"], 0)
         else:
-            self.warn("Kiterunner nicht verfügbar – übersprungen.")
+            self.warn("Kiterunner übersprungen / nicht verfügbar.")
 
         return gob_out, kr_out
 
@@ -636,10 +832,10 @@ class Pipeline:
         # Zielauswahl: URLs mit Parametern + Alive-Hosts
         targets: List[str] = []
         if params_file.exists():
-            targets.extend(self._read(params_file)[:20])
+            targets.extend(self._read(params_file)[:self.EXPLOIT_TARGET_LIMIT])
         if not targets and alive_file.exists():
             targets.extend(self._read(alive_file)[:5])
-        targets = sorted(set(targets))[:20]
+        targets = sorted(set(targets))[:self.EXPLOIT_TARGET_LIMIT]
         if not targets:
             self.warn("Keine Ziele für Exploit-Stages.")
             return xs_out, sq_out
@@ -647,46 +843,50 @@ class Pipeline:
         self.warn(f"Aktive Tests gegen {len(targets)} Ziele. Diese sind INVASIV.")
         self.warn(f"Stelle sicher, dass Du eine schriftliche Autorisierung für "
                   f"'{self.domain}' hast.")
-        if not self._prompt_yes_no("Exploit-Stages jetzt wirklich ausführen?", default_yes=False):
+        if not self._prompt_yes_no("Exploit-Stages jetzt wirklich ausführen?",
+                                   default_yes=False):
             self.warn("Exploit-Stages vom User abgebrochen.")
             return xs_out, sq_out
 
-        # XSStrike
-        if "XSStrike" in self.binaries:
-            xs_raw = self.out / "exploits" / "xsstrike_raw.txt"
-            xs_raw.unlink(missing_ok=True)
-            xs_bin = self.binaries["XSStrike"]
+        # --- XSStrike ---
+        if self._have("xsstrike"):
             for url in targets:
                 if "?" not in url:
                     url = url.rstrip("/") + "/?q=test"
-                cmd = ["python3", xs_bin, "-u", url,
+                out_file = self.out / "exploits" / f"xs_{self._uid()}.txt"
+                cmd = ["python3", self.binaries["xsstrike"], "-u", url,
                        "--crawl", "--blind", "--timeout", "10", "--skip-dom"]
-                rc, _ = self._run(cmd, timeout=300,
-                                  stdout_file=xs_raw.with_name(f"xs_{abs(hash(url))}.txt"))
-            merged = []
+                rc, _ = self._run(cmd, timeout=300, stdout_file=out_file)
+            merged: List[str] = []
             for f in (self.out / "exploits").glob("xs_*.txt"):
-                merged.extend(self._read(f))
-                f.unlink()
+                if f.exists():
+                    merged.extend(self._read(f))
+                    f.unlink()
             self._write(xs_out, merged)
             self._stage_result("xsstrike", xs_out, ["xsstrike"], 0)
         else:
-            self.warn("XSStrike nicht verfügbar.")
+            self.warn("XSStrike übersprungen / nicht verfügbar.")
 
-        # sqlmap
-        if "sqlmap" in self.binaries:
-            sq_raw = self.out / "exploits" / "sqlmap_raw.txt"
-            sq_raw.unlink(missing_ok=True)
-            sq_bin = self.binaries["sqlmap"]
+        # --- sqlmap ---
+        if self._have("sqlmap"):
             for url in targets:
-                cmd = ["python3", sq_bin, "-u", url,
+                # sqlmap-Output pro URL in eigene Datei, dann am Ende mergen.
+                # (Bugfix v2: sq_raw existierte vorher, wurde aber nie beschrieben.)
+                out_file = self.out / "exploits" / f"sq_{self._uid()}.txt"
+                cmd = ["python3", self.binaries["sqlmap"], "-u", url,
                        "--batch", "--random-agent", "--level=2", "--risk=1",
                        "--threads=2", "--timeout=10",
                        "--output-dir", str(self.out / "exploits" / "sqlmap_out")]
-                rc, _ = self._run(cmd, timeout=300)
-            self._write(sq_out, self._read(sq_raw))
+                rc, _ = self._run(cmd, timeout=300, stdout_file=out_file)
+            merged = []
+            for f in (self.out / "exploits").glob("sq_*.txt"):
+                if f.exists():
+                    merged.extend(self._read(f))
+                    f.unlink()
+            self._write(sq_out, merged)
             self._stage_result("sqlmap", sq_out, ["sqlmap"], 0)
         else:
-            self.warn("sqlmap nicht verfügbar.")
+            self.warn("sqlmap übersprungen / nicht verfügbar.")
 
         return xs_out, sq_out
 
@@ -720,14 +920,16 @@ class Pipeline:
     def _print_summary(self) -> None:
         dur = time.time() - self.start_time
         self.head(f"Pipeline abgeschlossen in {dur:.1f}s")
-        self.log(f"{C.W}Stage            Datei                                           Einträge{C.N}")
+        self.log(f"{C.W}Stage            Datei                                           "
+                 f"Einträge{C.N}")
         self.log("─" * 72)
         for name, info in self.results.items():
             try:
                 rel = Path(info["output"]).relative_to(self.out)
             except ValueError:
                 rel = Path(info["output"]).name
-            self.log(f"  {name:14s} {C.DIM}{str(rel):45s}{C.N}  {C.G}{info['lines']}{C.N}")
+            self.log(f"  {name:14s} {C.DIM}{str(rel):45s}{C.N}  "
+                     f"{C.G}{info['lines']}{C.N}")
         self.log("")
         self.ok(f"Alle Artefakte liegen in: {C.W}{self.out}{C.N}")
         self.ok(f"Log-Datei:                 {C.W}{self._logfile()}{C.N}")
@@ -747,6 +949,9 @@ class Pipeline:
 # =============================================================================
 #  CLI
 # =============================================================================
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
 def main() -> None:
     p = argparse.ArgumentParser(
         prog="recon.py",
@@ -769,7 +974,7 @@ Output landet in:  ./output/<domain>/
     p.add_argument("-o", "--output", default="./output/{domain}",
                    help="Output-Verzeichnis (default: ./output/<domain>)")
     p.add_argument("--dry-run", action="store_true",
-                   help="Nur Commands anzeigen, nichts ausführen")
+                   help="Nur Commands anzeigen, nichts ausführen und nichts installieren")
     p.add_argument("--force", action="store_true",
                    help="Stages neu ausführen, auch wenn Output existiert")
     p.add_argument("--yes", action="store_true",
@@ -782,19 +987,25 @@ Output landet in:  ./output/<domain>/
                         "arjun,gobuster,kiterunner,xsstrike,sqlmap)")
     p.add_argument("--only", default="",
                    help="Nur diese Stages ausführen (Komma-Liste)")
-    p.add_argument("--wordlist", default=str(Path.home() / "wordlists/directory-list-2.3-medium.txt"),
+    p.add_argument("--wordlist",
+                   default=str(Path.home() / "wordlists/directory-list-2.3-medium.txt"),
                    help="Wortliste für Gobuster")
-    p.add_argument("--kite", default=str(Path.home() / "tools/kiterunner-wordlists/large.kite"),
+    p.add_argument("--kite",
+                   default=str(Path.home() / "tools/kiterunner-wordlists/large.kite"),
                    help="Kiterunner-Wortliste (.kite)")
     p.add_argument("--threads", type=int, default=20,
                    help="Thread-Anzahl für Brute-Force-Stages")
     p.add_argument("--timeout", type=int, default=1800,
                    help="Globaler Timeout pro Stage (Sekunden)")
+    p.add_argument("--rate-limit", type=int, default=0,
+                   help="Rate-Limit für httpx (Requests/Sekunde, 0=default)")
+    p.add_argument("--linkfinder-workers", type=int, default=10,
+                   help="Parallele Worker für LinkFinder-Stage")
 
     args = p.parse_args()
     args.output = args.output.format(domain=args.domain)
-    if args.skip:   args.skip   = [s.strip() for s in args.skip.split(",") if s.strip()]
-    if args.only:   args.only   = [s.strip() for s in args.only.split(",") if s.strip()]
+    if args.skip:   args.skip = [s.strip() for s in args.skip.split(",") if s.strip()]
+    if args.only:   args.only = [s.strip() for s in args.only.split(",") if s.strip()]
 
     # PATH-Vorbereitung (für Go-Tools ohne 'source ~/.bashrc')
     extra = f"{os.path.expanduser('~/go/bin')}:{os.path.expanduser('~/tools')}"
