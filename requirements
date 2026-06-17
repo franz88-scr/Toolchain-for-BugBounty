@@ -8,8 +8,4 @@
 # Externe Dependencies werden durch install.sh installiert
 # (jeweils pro Tool in den offiziellen Repositories).
 #
-# ----------------------------------------------------------------------------
-# Optional
-# ----------------------------------------------------------------------------
-# Für farbigen Output in nicht-TTY Umgebungen:
-colorama>=0.4.6
+# Keine Python-Paketabhängigkeiten.

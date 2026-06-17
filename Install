@@ -20,16 +20,8 @@ set -euo pipefail
 # Konfiguration
 # ----------------------------------------------------------------------------
 TOOLS_DIR="${TOOLS_DIR:-$HOME/tools}"
-GO_BIN="$(go env GOPATH 2>/dev/null)/bin"
 
 mkdir -p "$TOOLS_DIR"
-
-# PATH erweitern
-export PATH="$GO_BIN:$PATH"
-
-if ! grep -q "$GO_BIN" "$HOME/.bashrc" 2>/dev/null; then
-    echo "export PATH=\"\$PATH:$GO_BIN\"" >> "$HOME/.bashrc"
-fi
 
 # ----------------------------------------------------------------------------
 # Logging
@@ -47,6 +39,23 @@ sudo apt-get update -qq
 sudo apt-get install -y -qq \
     golang-go git python3 python3-pip curl wget unzip \
     libpcap-dev build-essential
+
+if command -v go >/dev/null 2>&1; then
+    GO_BIN="$(go env GOPATH)/bin"
+else
+    GO_BIN="$HOME/go/bin"
+fi
+
+# PATH erweitern
+export PATH="$GO_BIN:$TOOLS_DIR:$PATH"
+
+if ! grep -Fq "$GO_BIN" "$HOME/.bashrc" 2>/dev/null; then
+    printf 'export PATH="$PATH:%s"\n' "$GO_BIN" >> "$HOME/.bashrc"
+fi
+
+if ! grep -Fq "$TOOLS_DIR" "$HOME/.bashrc" 2>/dev/null; then
+    printf 'export PATH="$PATH:%s"\n' "$TOOLS_DIR" >> "$HOME/.bashrc"
+fi
 
 # ----------------------------------------------------------------------------
 # Go Tools
@@ -114,12 +123,21 @@ KR_TARBALL="kiterunner-${KR_VERSION}-linux-amd64.tar.gz"
 KR_URL="https://github.com/assetnote/kiterunner/releases/download/v${KR_VERSION}/${KR_TARBALL}"
 
 if ! command -v kr >/dev/null 2>&1; then
-    cd /tmp
-    wget -q "$KR_URL" -O "$KR_TARBALL" || curl -sL "$KR_URL" -o "$KR_TARBALL"
+    KR_TMP="$(mktemp -d)"
+    trap 'rm -rf "$KR_TMP"' EXIT
+    cd "$KR_TMP"
+    wget -q "$KR_URL" -O "$KR_TARBALL" || curl -fsSL "$KR_URL" -o "$KR_TARBALL"
 
     tar -xzf "$KR_TARBALL"
 
-    sudo mv kiterunner /usr/local/bin/kr 2>/dev/null || mv kiterunner "$TOOLS_DIR/kr"
+    KR_BIN="$(find . -maxdepth 2 -type f \( -name kr -o -name kiterunner \) -perm /111 | head -n 1)"
+    if [[ -z "$KR_BIN" ]]; then
+        err "Kiterunner-Binary nicht im Release-Archiv gefunden"
+        exit 1
+    fi
+
+    sudo install -m 0755 "$KR_BIN" /usr/local/bin/kr 2>/dev/null || \
+        install -m 0755 "$KR_BIN" "$TOOLS_DIR/kr"
 
     mkdir -p "$TOOLS_DIR/kiterunner-wordlists"
 

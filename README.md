@@ -36,7 +36,8 @@ source ~/.bashrc
 usage: recon.py [-h] -d DOMAIN [-o OUTPUT] [--dry-run] [--force] [--yes]
                 [--no-exploit] [--skip SKIP] [--only ONLY]
                 [--wordlist WORDLIST] [--kite KITE] [--threads THREADS]
-                [--timeout TIMEOUT]
+                [--timeout TIMEOUT] [--rate-limit RATE_LIMIT]
+                [--linkfinder-workers LINKFINDER_WORKERS]
 ```
 
 ## Optionen
@@ -55,6 +56,8 @@ usage: recon.py [-h] -d DOMAIN [-o OUTPUT] [--dry-run] [--force] [--yes]
 | `--kite FILE` | Eigene Wortliste für Kiterunner |
 | `--threads N` | Anzahl der Threads für Brute-Force-Stages |
 | `--timeout N` | Globaler Timeout pro Stage in Sekunden |
+| `--rate-limit N` | Rate-Limit für httpx in Requests pro Sekunde (`0` = Tool-Default) |
+| `--linkfinder-workers N` | Parallele Worker für die LinkFinder-Stage |
 
 ---
 
@@ -210,6 +213,7 @@ cat ./bounty/*/urls/all_urls.txt | sort -u > all_endpoints.txt
 | Stages dauern sehr lange | `--timeout 600` setzen oder einzelne Stages überspringen |
 | Zu viele Hosts für Brute Force | `--threads 5` und kleinere Wortliste verwenden |
 | Falsche Sprache oder Encoding | `export LANG=C.UTF-8` |
+| `--domain` wird abgelehnt | Nur Domainnamen ohne Schema/Pfad verwenden, z. B. `example.com` statt `https://example.com/` |
 
 ---
 
